@@ -23,7 +23,7 @@ pub struct Args {
   #[arg(short, long)]
   pub model: String,
 
-  /// Number of parallel tasks to use for the benchmark execution
+  /// Number of parallel tasks
   #[arg(short, long, default_value = "1")]
   pub parallel: NonZero<usize>,
 
@@ -54,6 +54,7 @@ pub struct Args {
 #[derive(Clone, Debug, ValueEnum)]
 pub enum Provider {
   /// OpenAI's remote embedding API
+  #[value(name = "openai")]
   OpenAI,
   /// A Ollama instance
   Ollama,

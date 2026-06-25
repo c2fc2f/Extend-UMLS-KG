@@ -59,7 +59,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
   let rt = tokio::runtime::Builder::new_current_thread()
     .enable_all()
     .build()
-    .expect("Failed building the Runtime");
+    .context("Failed building the Runtime")?;
 
   let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -99,6 +99,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     .user(args.user)
     .password(args.password)
     .db(args.database.as_str())
+    .max_connections(args.parallel.get())
     .build()
     .context(
       "Neo4j ConfigBuilder failed despite all credentials being supplied",
@@ -130,8 +131,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let graph = Arc::clone(&graph);
 
         async move {
-          let concept: &str =
-            row.get("elementId(n)").context("Row missing 'id' column")?;
+          let concept: &str = row.get("elementId(n)").context(
+            "\
+              Failed to retrieve UMLSConcept ({concept}) with no embedding \
+              property\
+            ",
+          )?;
 
           add_embedding(concept, &graph, &embeder).await
         }
@@ -150,7 +155,10 @@ async fn add_embedding(
 ) -> anyhow::Result<()> {
   let q = query(
     "\
-      MATCH (n)-[:HAS_DEFINITION]->(d0:UMLSDefinition)
+      MATCH (n:UMLSConcept)
+      WHERE elementId(n) = $id
+
+      OPTIONAL MATCH (n)-[:HAS_DEFINITION]->(d0:UMLSDefinition)
       WITH n, collect(d0.value) AS d0_list
 
       CALL (n, d0_list) {
