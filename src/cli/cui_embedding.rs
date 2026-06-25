@@ -8,7 +8,7 @@ use clap::ValueEnum;
 #[derive(clap::Args, Debug)]
 pub struct Args {
   /// The API provider to use for generating the embeddings
-  #[arg(short, long)]
+  #[arg(long)]
   pub provider: Provider,
 
   /// An optional custom base URL for the provider's API endpoint

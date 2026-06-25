@@ -21,7 +21,7 @@ use rig_core::{
 use crate::cli::cui_embedding::{Args, Provider};
 
 /// A dynamic dispatcher for text embedding models from various LLM providers
-pub enum DynamicEmbeder {
+pub enum DynamicEmbedder {
   /// Wraps an [`ollama::EmbeddingModel`].
   Ollama(ollama::EmbeddingModel),
 
@@ -29,7 +29,7 @@ pub enum DynamicEmbeder {
   OpenAI(openai::EmbeddingModel),
 }
 
-impl DynamicEmbeder {
+impl DynamicEmbedder {
   /// Generates an embedding for the provided texts by delegating the request
   /// to the currently active LLM provider.
   ///
@@ -63,7 +63,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
   let _ = rustls::crypto::ring::default_provider().install_default();
 
-  let embeder = match args.provider {
+  let embedder = match args.provider {
     Provider::Ollama => {
       let mut client = ollama::Client::builder()
         .api_key(args.api_key.as_deref().unwrap_or_default());
@@ -71,7 +71,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         client = client.base_url(base_url);
       }
       client.build().map(|c| {
-        Arc::new(DynamicEmbeder::Ollama(c.embedding_model(args.model)))
+        Arc::new(DynamicEmbedder::Ollama(c.embedding_model(args.model)))
       })
     }
     Provider::OpenAI => {
@@ -88,7 +88,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         client = client.base_url(base_url);
       }
       client.build().map(|c| {
-        Arc::new(DynamicEmbeder::OpenAI(c.embedding_model(args.model)))
+        Arc::new(DynamicEmbedder::OpenAI(c.embedding_model(args.model)))
       })
     }
   }
@@ -99,7 +99,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     .user(args.user)
     .password(args.password)
     .db(args.database.as_str())
-    .max_connections(args.parallel.get())
+    .max_connections(args.parallel.get() + 1)
     .build()
     .context(
       "Neo4j ConfigBuilder failed despite all credentials being supplied",
@@ -127,18 +127,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
       .into_stream()
       .map_err(|e| anyhow::anyhow!(e))
       .try_for_each_concurrent(args.parallel.get(), |row| {
-        let embeder = Arc::clone(&embeder);
+        let embedder = Arc::clone(&embedder);
         let graph = Arc::clone(&graph);
 
         async move {
-          let concept: &str = row.get("elementId(n)").context(
-            "\
-              Failed to retrieve UMLSConcept ({concept}) with no embedding \
-              property\
-            ",
-          )?;
+          let concept: &str = row
+            .get("elementId(n)")
+            .context("Row missing 'elementId(n)' column")?;
 
-          add_embedding(concept, &graph, &embeder).await
+          add_embedding(concept, &graph, &embedder).await
         }
       })
       .await
@@ -151,7 +148,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 async fn add_embedding(
   concept: &str,
   graph: &Graph,
-  embeder: &DynamicEmbeder,
+  embedder: &DynamicEmbedder,
 ) -> anyhow::Result<()> {
   let q = query(
     "\
@@ -225,7 +222,7 @@ async fn add_embedding(
     ));
   }
 
-  let embeddings = embeder.embed_texts(defs).await.context(
+  let embeddings = embedder.embed_texts(defs).await.context(
     "Failed to generate text embeddings for the retrieved definitions",
   )?;
 
