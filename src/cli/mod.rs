@@ -1,6 +1,7 @@
 //! Command-line interface definition for the binary
 
 pub mod completion;
+pub mod cui_embedding;
 
 use clap::{Parser, Subcommand};
 
@@ -18,6 +19,8 @@ pub struct Args {
 #[derive(Subcommand, Debug)]
 #[non_exhaustive]
 pub enum Command {
+  /// Enriches UMLS Concepts with an additional "embedding" property
+  CuiEmbedding(cui_embedding::Args),
   /// Print shell completions and exit
   #[command(hide = true)]
   Completion(completion::Args),

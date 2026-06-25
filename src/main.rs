@@ -2,15 +2,16 @@
 //! additional nodes, relationships, and external metadata
 
 pub mod cli;
+mod subcommand;
 
 use cli::{Args, Command};
 
-use std::{io::stdout, process::ExitCode};
+use std::io::stdout;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 
-fn main() -> ExitCode {
+fn main() -> anyhow::Result<()> {
   let args = Args::parse();
 
   match args.command {
@@ -18,7 +19,8 @@ fn main() -> ExitCode {
       let mut cmd = cli::Args::command();
       let name = cmd.get_name().to_string();
       generate(a.shell, &mut cmd, name, &mut stdout());
-      ExitCode::SUCCESS
+      Ok(())
     }
+    Command::CuiEmbedding(a) => subcommand::cui_embedding::run(a),
   }
 }
