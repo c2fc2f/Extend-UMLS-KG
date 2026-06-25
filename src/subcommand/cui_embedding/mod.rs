@@ -17,6 +17,7 @@ use rig_core::{
   embeddings::{Embedding, EmbeddingError, EmbeddingModel},
   providers::{ollama, openai},
 };
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::cli::cui_embedding::{Args, Provider};
 
@@ -30,6 +31,14 @@ pub enum DynamicEmbedder {
 }
 
 impl DynamicEmbedder {
+  /// Human-readable name of the active provider, used for log fields.
+  fn provider_name(&self) -> &'static str {
+    match self {
+      Self::Ollama(_) => "ollama",
+      Self::OpenAI(_) => "openai",
+    }
+  }
+
   /// Generates an embedding for the provided texts by delegating the request
   /// to the currently active LLM provider.
   ///
@@ -43,19 +52,46 @@ impl DynamicEmbedder {
   /// Returns an [`EmbeddingError`] if the underlying provider encounters an
   /// issue. This can include network timeouts, authentication failures
   /// (e.g., an invalid API key), or API rate limits.
+  #[instrument(
+    skip_all,
+    fields(provider = self.provider_name(), texts = texts.len())
+  )]
   pub async fn embed_texts(
     &self,
     texts: Vec<String>,
   ) -> Result<Vec<Embedding>, EmbeddingError> {
-    match self {
+    debug!("requesting embeddings from provider");
+
+    let result = match self {
       Self::Ollama(a) => a.embed_texts(texts).await,
       Self::OpenAI(a) => a.embed_texts(texts).await,
+    };
+
+    match &result {
+      Ok(embeddings) => {
+        debug!(count = embeddings.len(), "provider returned embeddings")
+      }
+      Err(error) => warn!(%error, "provider failed to return embeddings"),
     }
+
+    result
   }
 }
 
 /// Entry point to this command
+#[instrument(
+  skip_all,
+  fields(
+    provider = ?args.provider,
+    model = %args.model,
+    parallel = args.parallel.get(),
+    uri = %args.uri,
+    database = %args.database
+  )
+)]
 pub fn run(args: Args) -> anyhow::Result<()> {
+  info!("starting cui-embedding");
+
   let rt = tokio::runtime::Builder::new_current_thread()
     .enable_all()
     .build()
@@ -65,9 +101,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
   let embedder = match args.provider {
     Provider::Ollama => {
+      debug!("initialising ollama embedding client");
       let mut client = ollama::Client::builder()
         .api_key(args.api_key.as_deref().unwrap_or_default());
       if let Some(base_url) = args.base_url {
+        debug!(%base_url, "using custom base url");
         client = client.base_url(base_url);
       }
       client.build().map(|c| {
@@ -75,6 +113,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
       })
     }
     Provider::OpenAI => {
+      debug!("initialising openai embedding client");
       let Some(api_key) = args.api_key else {
         return Err(anyhow::anyhow!(
           "\
@@ -85,6 +124,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
       };
       let mut client = openai::Client::builder().api_key(api_key);
       if let Some(base_url) = args.base_url {
+        debug!(%base_url, "using custom base url");
         client = client.base_url(base_url);
       }
       client.build().map(|c| {
@@ -93,6 +133,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
   }
   .context("Error during initialization of the embedding model")?;
+
+  debug!("embedding client initialised");
+
+  debug!(
+    uri = %args.uri,
+    user = %args.user,
+    database = %args.database,
+    "connecting to neo4j"
+  );
 
   let config = neo4rs::ConfigBuilder::default()
     .uri(&args.uri)
@@ -115,9 +164,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
       })?,
   );
 
+  info!("connected to neo4j");
+
   let query = query(
     "MATCH (n:UMLSConcept) WHERE n.embedding IS NULL RETURN elementId(n)",
   );
+
+  debug!("scanning for concepts missing an embedding");
 
   rt.block_on(async {
     graph
@@ -139,17 +192,23 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
       })
       .await
-  })
+  })?;
+
+  info!("finished cui-embedding");
+  Ok(())
 }
 
 /// Resolves text definitions for a given UMLS Concept ID, computes their
 /// embeddings, averages them via mean pooling, and updates the node vector
 /// property in Neo4j.
+#[instrument(skip_all, fields(concept = %concept))]
 async fn add_embedding(
   concept: &str,
   graph: &Graph,
   embedder: &DynamicEmbedder,
 ) -> anyhow::Result<()> {
+  trace!("resolving definitions");
+
   let q = query(
     "\
       MATCH (n:UMLSConcept)
@@ -217,10 +276,13 @@ async fn add_embedding(
     .context("The 'definitions' property is missing or invalid")?;
 
   if defs.is_empty() {
+    warn!("no definitions resolved for concept");
     return Err(anyhow::anyhow!(
       "No defs were retrieved for the concept ({concept})"
     ));
   }
+
+  debug!(definitions = defs.len(), "resolved definitions");
 
   let embeddings = embedder.embed_texts(defs).await.context(
     "Failed to generate text embeddings for the retrieved definitions",
@@ -243,6 +305,12 @@ async fn add_embedding(
     *val /= count;
   }
 
+  trace!(
+    dim,
+    vectors = embeddings.len(),
+    "mean-pooled embedding vectors"
+  );
+
   let q = query(
     "\
       MATCH (c:UMLSConcept)
@@ -256,5 +324,9 @@ async fn add_embedding(
   graph
     .run(q)
     .await
-    .context("Failed to write pooled embedding for concept")
+    .context("Failed to write pooled embedding for concept")?;
+
+  info!(definitions = embeddings.len(), dim, "stored embedding");
+  Ok(())
 }
+

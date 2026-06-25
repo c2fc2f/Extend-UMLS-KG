@@ -4,6 +4,7 @@ pub mod completion;
 pub mod cui_embedding;
 
 use clap::{Parser, Subcommand};
+use clap_verbosity_flag::Verbosity;
 
 /// A multitool for extending UMLS knowledge graphs (CSV-based for Neo4J) with
 /// additional nodes, relationships, and external metadata
@@ -13,6 +14,10 @@ pub struct Args {
   /// The specific operation to perform with the binary
   #[command(subcommand)]
   pub command: Command,
+
+  /// Control the output verbosity (-v, -q)
+  #[command(flatten)]
+  pub verbosity: Verbosity,
 }
 
 /// List of available subcommands in the binary

@@ -34,6 +34,13 @@ missing_panics_doc = "warn"
 [dependencies]
 clap = { version = "4", features = [ "derive", "env" ] }
 clap_complete = "4"
+clap-verbosity-flag = {
+  version = "3",
+  default-features = false,
+  features = [ "tracing" ]
+}
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [ "env-filter" ] }
 tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
 rig-core = "0.39"
@@ -45,4 +52,9 @@ anyhow = "1.0.102"
 clap = { version = "4", features = [ "derive", "env", "string" ] }
 clap_mangen = "0.3"
 clap_complete = "4"
+clap-verbosity-flag = {
+  version = "3",
+  default-features = false,
+  features = [ "tracing" ]
+}
 
