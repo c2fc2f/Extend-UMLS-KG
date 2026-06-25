@@ -1,11 +1,12 @@
 //! `cui-embedding` subcommand:
 
+use core::fmt;
 use std::num::NonZero;
 
 use clap::ValueEnum;
 
 /// Enriches UMLS Concepts with an additional "embedding" property
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 pub struct Args {
   /// The API provider to use for generating the embeddings
   #[arg(long)]
@@ -16,7 +17,7 @@ pub struct Args {
   pub base_url: Option<String>,
 
   /// The authentication key for the selected provider
-  #[arg(long, env = "API_KEY")]
+  #[arg(long, env = "PROVIDER_API_KEY")]
   pub api_key: Option<String>,
 
   /// The specific model to use for the embeddings
@@ -48,6 +49,24 @@ pub struct Args {
   /// Name of the target database within the Neo4j instance.
   #[arg(long, env = "NEO4J_DB", default_value = "neo4j")]
   pub database: String,
+}
+
+impl fmt::Debug for Args {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    const REDACTED: &str = "[REDACTED]";
+
+    f.debug_struct("Args")
+      .field("provider", &self.provider)
+      .field("base_url", &self.base_url)
+      .field("api_key", &self.api_key.as_ref().map(|_| REDACTED))
+      .field("model", &self.model)
+      .field("parallel", &self.parallel)
+      .field("uri", &self.uri)
+      .field("user", &self.user)
+      .field("password", &REDACTED)
+      .field("database", &self.database)
+      .finish()
+  }
 }
 
 /// Supported API providers for generating text embeddings

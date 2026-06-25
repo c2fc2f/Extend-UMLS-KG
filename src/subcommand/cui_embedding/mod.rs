@@ -78,6 +78,41 @@ impl DynamicEmbedder {
   }
 }
 
+/// Computes the component-wise mean of a set of equal-length vectors.
+///
+/// # Errors
+///
+/// Returns an error if `vectors` is empty, if any vector has dimension zero,
+/// or if the vectors do not all share the same dimensionality.
+fn mean_pool(vectors: &[&[f64]]) -> anyhow::Result<Vec<f64>> {
+  let (first, rest) = vectors
+    .split_first()
+    .context("cannot mean-pool an empty set of vectors")?;
+
+  let dim = first.len();
+  anyhow::ensure!(dim > 0, "embedding vectors have dimension zero");
+
+  let mut pooled = first.to_vec();
+  for (index, vector) in rest.iter().enumerate() {
+    anyhow::ensure!(
+      vector.len() == dim,
+      "vector {} has dimension {} but expected {dim}",
+      index + 1,
+      vector.len()
+    );
+    for (acc, &value) in pooled.iter_mut().zip(vector.iter()) {
+      *acc += value;
+    }
+  }
+
+  let count = vectors.len() as f64;
+  for value in &mut pooled {
+    *value /= count;
+  }
+
+  Ok(pooled)
+}
+
 /// Entry point to this command
 #[instrument(
   skip_all,
@@ -167,7 +202,49 @@ pub fn run(args: Args) -> anyhow::Result<()> {
   info!("connected to neo4j");
 
   let query = query(
-    "MATCH (n:UMLSConcept) WHERE n.embedding IS NULL RETURN elementId(n)",
+    "\
+      MATCH (n:UMLSConcept)
+      WHERE n.embedding IS NULL
+
+      OPTIONAL MATCH (n)-[:HAS_DEFINITION]->(d0:UMLSDefinition)
+      WITH n, collect(d0.value) AS d0_list
+
+      CALL (n, d0_list) {
+        WITH *
+        WHERE size(d0_list) = 0
+        OPTIONAL MATCH
+          (n)<-[:IS_LEXICAL_OF { isPreferred: true }]-(:UMLSLexical)
+             <-[:IS_STRING_OF  { isPreferred: true }]-(:UMLSString)
+             <-[:IS_ATOM_OF    { isPreferred: true }]-(a0:UMLSAtom)
+        OPTIONAL MATCH (a0)-[:HAS_DEFINITION]->(d1:UMLSDefinition)
+        RETURN
+          collect(DISTINCT d1.value) AS d1_list,
+          collect(DISTINCT a0.value) AS a0_list
+      }
+
+      CALL (n, d0_list, d1_list) {
+        WITH *
+        WHERE size(d0_list) = 0 AND size(d1_list) = 0
+        OPTIONAL MATCH
+          (n)<-[:IS_LEXICAL_OF]-(:UMLSLexical)
+             <-[:IS_STRING_OF ]-(:UMLSString)
+             <-[:IS_ATOM_OF   ]-(a1:UMLSAtom)
+        OPTIONAL MATCH (a1)-[:HAS_DEFINITION]->(d2:UMLSDefinition)
+        RETURN
+          collect(DISTINCT d2.value) AS d2_list,
+          collect(DISTINCT a1.value) AS a1_list
+      }
+
+      RETURN
+        elementId(n) AS id,
+        CASE
+          WHEN size(d0_list) > 0 THEN d0_list
+          WHEN size(d1_list) > 0 THEN d1_list
+          WHEN size(d2_list) > 0 THEN d2_list
+          WHEN size(a0_list) > 0 THEN a0_list
+          ELSE a1_list
+        END AS definitions\
+    ",
   );
 
   debug!("scanning for concepts missing an embedding");
@@ -184,11 +261,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let graph = Arc::clone(&graph);
 
         async move {
-          let concept: &str = row
-            .get("elementId(n)")
-            .context("Row missing 'elementId(n)' column")?;
+          let id: &str =
+            row.get("id").context("scan row missing 'id' column")?;
+          let definitions: Vec<String> = row
+            .get("definitions")
+            .context("scan row missing 'definitions' column")?;
 
-          add_embedding(concept, &graph, &embedder).await
+          add_embedding(id, definitions, &graph, &embedder).await
         }
       })
       .await
@@ -198,112 +277,48 @@ pub fn run(args: Args) -> anyhow::Result<()> {
   Ok(())
 }
 
-/// Resolves text definitions for a given UMLS Concept ID, computes their
-/// embeddings, averages them via mean pooling, and updates the node vector
-/// property in Neo4j.
-#[instrument(skip_all, fields(concept = %concept))]
+/// Computes the embedding for one concept from its pre-resolved definition
+/// texts and writes the mean-pooled vector back onto the node.
+///
+/// # Errors
+///
+/// Returns an error if the provider fails, if the returned vectors cannot be
+/// pooled, or if the write to Neo4j fails or times out.
+#[instrument(
+  skip_all,
+  fields(concept = %concept, definitions = definitions.len())
+)]
 async fn add_embedding(
   concept: &str,
+  definitions: Vec<String>,
   graph: &Graph,
   embedder: &DynamicEmbedder,
 ) -> anyhow::Result<()> {
-  trace!("resolving definitions");
-
-  let q = query(
-    "\
-      MATCH (n:UMLSConcept)
-      WHERE elementId(n) = $id
-
-      OPTIONAL MATCH (n)-[:HAS_DEFINITION]->(d0:UMLSDefinition)
-      WITH n, collect(d0.value) AS d0_list
-
-      CALL (n, d0_list) {
-        WITH * 
-        WHERE size(d0_list) = 0 
-        OPTIONAL MATCH 
-          (n)<-[:IS_LEXICAL_OF { isPreferred: true }]-(:UMLSLexical)
-             <-[:IS_STRING_OF  { isPreferred: true }]-(:UMLSString)
-             <-[:IS_ATOM_OF    { isPreferred: true }]-(a0:UMLSAtom)
-        OPTIONAL
-          MATCH (a0)-[:HAS_DEFINITION]->(d1:UMLSDefinition)
-        RETURN
-          collect(DISTINCT d1.value) AS d1_list,
-          collect(DISTINCT a0.value) AS a0_list
-      }
-
-      CALL (n, d0_list, d1_list) {
-        WITH * 
-        WHERE
-          size(d0_list) = 0 AND
-          size(d1_list) = 0 
-        OPTIONAL MATCH
-          (n)<-[:IS_LEXICAL_OF]-(:UMLSLexical)
-             <-[:IS_STRING_OF ]-(:UMLSString)
-             <-[:IS_ATOM_OF   ]-(a1:UMLSAtom)
-        OPTIONAL MATCH
-          (a1)-[:HAS_DEFINITION]->(d2:UMLSDefinition)
-        RETURN
-          collect(DISTINCT d2.value) AS d2_list,
-          collect(DISTINCT a1.value) AS a1_list
-      }
-
-      RETURN CASE
-        WHEN size(d0_list) > 0 THEN d0_list
-        WHEN size(d1_list) > 0 THEN d1_list
-        WHEN size(d2_list) > 0 THEN d2_list
-        WHEN size(a0_list) > 0 THEN a0_list
-        ELSE a1_list
-      END AS definitions\
-    ",
-  )
-  .param("id", concept);
-
-  let defs: Vec<String> = graph
-    .execute(q)
-    .await
-    .with_context(|| {
-      format!(
-        "\
-          Failed to retrieve UMLSConcept ({concept}) with no embedding \
-          property\
-        "
-      )
-    })?
-    .next()
-    .await?
-    .context("No record found in the query result set")?
-    .get("definitions")
-    .context("The 'definitions' property is missing or invalid")?;
-
-  if defs.is_empty() {
-    warn!("no definitions resolved for concept");
-    return Err(anyhow::anyhow!(
-      "No defs were retrieved for the concept ({concept})"
-    ));
+  if definitions.is_empty() {
+    warn!("no text resolved; skipping concept");
+    return Ok(());
   }
 
-  debug!(definitions = defs.len(), "resolved definitions");
+  let wanted = definitions.len();
+  debug!(definitions = wanted, "resolved definitions");
 
-  let embeddings = embedder.embed_texts(defs).await.context(
+  let embeddings = embedder.embed_texts(definitions).await.context(
     "Failed to generate text embeddings for the retrieved definitions",
   )?;
 
-  let first = embeddings
-    .first()
-    .context("No embeddings were generated for the definitions")?;
-
-  let dim = first.vec.len();
-  let count = embeddings.len() as f64;
-
-  let mut pooled_vector = vec![0.0_f64; dim];
-  for embedding in &embeddings {
-    for (acc, &value) in pooled_vector.iter_mut().zip(&embedding.vec) {
-      *acc += value;
-    }
+  if embeddings.len() != wanted {
+    warn!(
+      wanted,
+      got = embeddings.len(),
+      "provider returned a different number of embeddings than inputs"
+    );
   }
-  for val in &mut pooled_vector {
-    *val /= count;
-  }
+
+  let vectors: Vec<&[f64]> =
+    embeddings.iter().map(|e| e.vec.as_slice()).collect();
+  let pooled =
+    mean_pool(&vectors).context("Failed to mean-pool embedding vectors")?;
+  let dim = pooled.len();
 
   trace!(
     dim,
@@ -319,7 +334,7 @@ async fn add_embedding(
    ",
   )
   .param("id", concept)
-  .param("embedding", pooled_vector);
+  .param("embedding", pooled);
 
   graph
     .run(q)
@@ -330,3 +345,43 @@ async fn add_embedding(
   Ok(())
 }
 
+/// Unit tests for the pure pooling logic.
+#[cfg(test)]
+#[allow(clippy::missing_docs_in_private_items)]
+mod tests {
+  use super::mean_pool;
+
+  #[test]
+  fn single_vector_is_returned_unchanged() {
+    let v = [1.0, 2.0, 3.0];
+    let pooled = mean_pool(&[v.as_slice()]).expect("pooling should succeed");
+    assert_eq!(pooled, vec![1.0, 2.0, 3.0]);
+  }
+
+  #[test]
+  fn averages_vectors_component_wise() {
+    let a = [0.0, 2.0, 4.0];
+    let b = [2.0, 4.0, 6.0];
+    let pooled =
+      mean_pool(&[a.as_slice(), b.as_slice()]).expect("pooling should succeed");
+    assert_eq!(pooled, vec![1.0, 3.0, 5.0]);
+  }
+
+  #[test]
+  fn empty_input_is_an_error() {
+    assert!(mean_pool(&[]).is_err());
+  }
+
+  #[test]
+  fn zero_dimension_is_an_error() {
+    let empty: [f64; 0] = [];
+    assert!(mean_pool(&[empty.as_slice()]).is_err());
+  }
+
+  #[test]
+  fn dimension_mismatch_is_an_error() {
+    let a = [1.0, 2.0];
+    let b = [1.0, 2.0, 3.0];
+    assert!(mean_pool(&[a.as_slice(), b.as_slice()]).is_err());
+  }
+}
